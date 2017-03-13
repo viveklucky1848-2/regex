@@ -27,7 +27,7 @@ use prog::Program;
 use re_builder::RegexOptions;
 use re_bytes;
 use re_set;
-use re_trait::{RegularExpression, Slot};
+use re_trait::{RegularExpression, Slot, Locations, as_slots};
 use re_unicode;
 use utf8::next_utf8;
 
@@ -222,6 +222,12 @@ impl ExecBuilder {
                     .allow_bytes(!self.only_utf8);
             let expr = try!(parser.parse(pat));
             bytes = bytes || expr.has_bytes();
+
+            if !expr.is_anchored_start() && expr.has_anchored_start() {
+                // Partial anchors unfortunately make it hard to use prefixes,
+                // so disable them.
+                prefixes = None;
+            }
             prefixes = prefixes.and_then(|mut prefixes| {
                 if !prefixes.union_prefixes(&expr) {
                     None
@@ -229,6 +235,12 @@ impl ExecBuilder {
                     Some(prefixes)
                 }
             });
+
+            if !expr.is_anchored_end() && expr.has_anchored_end() {
+                // Partial anchors unfortunately make it hard to use suffixes,
+                // so disable them.
+                suffixes = None;
+            }
             suffixes = suffixes.and_then(|mut suffixes| {
                 if !suffixes.union_suffixes(&expr) {
                     None
@@ -298,7 +310,6 @@ impl ExecBuilder {
             match_type: MatchType::Nothing,
         };
         ro.match_type = ro.choose_match_type(self.match_type);
-        // println!("MATCH TYPE for '{:?}': {:?}", ro.res, ro.match_type);
 
         let ro = Arc::new(ro);
         Ok(Exec { ro: ro, cache: CachedThreadLocal::new() })
@@ -332,11 +343,11 @@ impl<'c> RegularExpression for ExecNoSyncStr<'c> {
     #[inline(always)] // reduces constant overhead
     fn read_captures_at(
         &self,
-        slots: &mut [Slot],
+        locs: &mut Locations,
         text: &str,
         start: usize,
     ) -> Option<(usize, usize)> {
-        self.0.read_captures_at(slots, text.as_bytes(), start)
+        self.0.read_captures_at(locs, text.as_bytes(), start)
     }
 }
 
@@ -501,10 +512,11 @@ impl<'c> RegularExpression for ExecNoSync<'c> {
     /// locations of the overall match.
     fn read_captures_at(
         &self,
-        slots: &mut [Slot],
+        locs: &mut Locations,
         text: &[u8],
         start: usize,
     ) -> Option<(usize, usize)> {
+        let slots = as_slots(locs);
         for slot in slots.iter_mut() {
             *slot = None;
         }
@@ -589,7 +601,11 @@ impl<'c> ExecNoSync<'c> {
                 lits.find_start(&text[start..])
                     .map(|(s, e)| (start + s, start + e))
             }
-            AnchoredEnd => self.ro.suffixes.find_end(&text),
+            AnchoredEnd => {
+                let lits = &self.ro.suffixes;
+                lits.find_end(&text[start..])
+                    .map(|(s, e)| (start + s, start + e))
+            }
         }
     }
 
@@ -834,13 +850,12 @@ impl<'c> ExecNoSync<'c> {
         match_start: usize,
         match_end: usize,
     ) -> Option<(usize, usize)> {
-        // We can't use match_end directly, because we may need to examine
-        // one "character" after the end of a match for lookahead operators.
-        let e = if self.ro.nfa.uses_bytes() {
-            cmp::min(match_end + 1, text.len())
-        } else {
-            cmp::min(next_utf8(text, match_end), text.len())
-        };
+        // We can't use match_end directly, because we may need to examine one
+        // "character" after the end of a match for lookahead operators. We
+        // need to move two characters beyond the end, since some look-around
+        // operations may falsely assume a premature end of text otherwise.
+        let e = cmp::min(
+            next_utf8(text, next_utf8(text, match_end)), text.len());
         self.captures_nfa(slots, &text[..e], match_start)
     }
 
@@ -917,7 +932,7 @@ impl<'c> ExecNoSync<'c> {
                 matches,
                 slots,
                 quit_after_match,
-                ByteInput::new(text),
+                ByteInput::new(text, self.ro.nfa.only_utf8),
                 start)
         } else {
             pikevm::Fsm::exec(
@@ -945,7 +960,7 @@ impl<'c> ExecNoSync<'c> {
                 &self.cache,
                 matches,
                 slots,
-                ByteInput::new(text),
+                ByteInput::new(text, self.ro.nfa.only_utf8),
                 start)
         } else {
             backtrack::Bounded::exec(
@@ -1109,6 +1124,12 @@ impl ExecReadOnly {
         // If our set of prefixes is complete, then we can use it to find
         // a match in lieu of a regex engine. This doesn't quite work well in
         // the presence of multiple regexes, so only do it when there's one.
+        //
+        // TODO(burntsushi): Also, don't try to match literals if the regex is
+        // partially anchored. We could technically do it, but we'd need to
+        // create two sets of literals: all of them and then the subset that
+        // aren't anchored. We would then only search for all of them when at
+        // the beginning of the input and use the subset in all other cases.
         if self.res.len() == 1 {
             if self.nfa.prefixes.complete() {
                 return if self.nfa.is_anchored_start {

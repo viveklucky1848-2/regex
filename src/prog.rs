@@ -351,36 +351,6 @@ pub enum EmptyLook {
     NotWordBoundaryAscii,
 }
 
-impl InstEmptyLook {
-    /// Tests whether the pair of characters matches this zero-width
-    /// instruction.
-    pub fn matches(&self, c1: Char, c2: Char) -> bool {
-        use self::EmptyLook::*;
-        match self.look {
-            StartLine => c1.is_none() || c1 == '\n',
-            EndLine => c2.is_none() || c2 == '\n',
-            StartText => c1.is_none(),
-            EndText => c2.is_none(),
-            WordBoundary => {
-                let (w1, w2) = (c1.is_word_char(), c2.is_word_char());
-                w1 ^ w2
-            }
-            NotWordBoundary => {
-                let (w1, w2) = (c1.is_word_char(), c2.is_word_char());
-                !(w1 ^ w2)
-            }
-            WordBoundaryAscii => {
-                let (w1, w2) = (c1.is_word_byte(), c2.is_word_byte());
-                w1 ^ w2
-            }
-            NotWordBoundaryAscii => {
-                let (w1, w2) = (c1.is_word_byte(), c2.is_word_byte());
-                !(w1 ^ w2)
-            }
-        }
-    }
-}
-
 /// Representation of the Char instruction.
 #[derive(Clone, Debug)]
 pub struct InstChar {

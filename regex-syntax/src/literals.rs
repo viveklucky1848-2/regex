@@ -99,6 +99,21 @@ impl Literals {
         &self.lits
     }
 
+    /// Returns the length of the smallest literal.
+    ///
+    /// Returns None is there are no literals in the set.
+    pub fn min_len(&self) -> Option<usize> {
+        let mut min = None;
+        for lit in &self.lits {
+            match min {
+                None => min = Some(lit.len()),
+                Some(m) if lit.len() < m => min = Some(lit.len()),
+                _ => {}
+            }
+        }
+        min
+    }
+
     /// Returns true if all members in this set are complete.
     pub fn all_complete(&self) -> bool {
         !self.lits.is_empty() && self.lits.iter().all(|l| !l.is_cut())
@@ -164,6 +179,30 @@ impl Literals {
         &self.lits[0][self.lits[0].len() - len..]
     }
 
+    /// Returns a new set of literals with the given number of bytes trimmed
+    /// from the suffix of each literal.
+    ///
+    /// If any literal would be cut out completely by trimming, then None is
+    /// returned.
+    ///
+    /// Any duplicates that are created as a result of this transformation are
+    /// removed.
+    pub fn trim_suffix(&self, num_bytes: usize) -> Option<Literals> {
+        if self.min_len().map(|len| len <= num_bytes).unwrap_or(true) {
+            return None;
+        }
+        let mut new = self.to_empty();
+        for mut lit in self.lits.iter().cloned() {
+            let new_len = lit.len() - num_bytes;
+            lit.truncate(new_len);
+            lit.cut();
+            new.lits.push(lit);
+        }
+        new.lits.sort();
+        new.lits.dedup();
+        Some(new)
+    }
+
     /// Returns a new set of prefixes of this set of literals that are
     /// guaranteed to be unambiguous.
     ///
@@ -177,14 +216,17 @@ impl Literals {
         if self.lits.is_empty() {
             return self.to_empty();
         }
+        let mut old: Vec<Lit> = self.lits.iter().cloned().collect();
         let mut new = self.to_empty();
     'OUTER:
-        for lit1 in &self.lits {
-            if new.lits.is_empty() {
-                new.lits.push(lit1.clone());
+        while let Some(mut candidate) = old.pop() {
+            if candidate.is_empty() {
                 continue;
             }
-            let mut candidate = lit1.clone();
+            if new.lits.is_empty() {
+                new.lits.push(candidate);
+                continue;
+            }
             for lit2 in &mut new.lits {
                 if lit2.is_empty() {
                     continue;
@@ -197,17 +239,23 @@ impl Literals {
                     lit2.cut = candidate.cut;
                     continue 'OUTER;
                 }
-                if candidate.len() <= lit2.len() {
+                if candidate.len() < lit2.len() {
                     if let Some(i) = position(&candidate, &lit2) {
-                        lit2.truncate(i);
-                        lit2.cut();
                         candidate.cut();
+                        let mut lit3 = lit2.clone();
+                        lit3.truncate(i);
+                        lit3.cut();
+                        old.push(lit3);
+                        lit2.clear();
                     }
                 } else {
                     if let Some(i) = position(&lit2, &candidate) {
-                        candidate.truncate(i);
-                        candidate.cut();
                         lit2.cut();
+                        let mut new_candidate = candidate.clone();
+                        new_candidate.truncate(i);
+                        new_candidate.cut();
+                        old.push(new_candidate);
+                        candidate.clear();
                     }
                 }
                 // Oops, the candidate is already represented in the set.
@@ -771,7 +819,7 @@ fn repeat_range_literals<F: FnMut(&Expr, &mut Literals)>(
             let n = cmp::min(lits.limit_size, min as usize);
             let es = iter::repeat(e.clone()).take(n).collect();
             f(&Concat(es), lits);
-            if n < min as usize {
+            if n < min as usize || lits.contains_empty() {
                 lits.cut();
             }
         }
@@ -1108,8 +1156,9 @@ mod tests {
 
     // Test regexes with empty assertions.
     test_lit!(pfx_empty1, prefixes, "^a", M("a"));
-    test_lit!(pfx_empty2, prefixes, "^abc", M("abc"));
-    test_lit!(pfx_empty3, prefixes, "(?:^abc)|(?:^z)", M("abc"), M("z"));
+    test_lit!(pfx_empty2, prefixes, "a${2}", C("a"));
+    test_lit!(pfx_empty3, prefixes, "^abc", M("abc"));
+    test_lit!(pfx_empty4, prefixes, "(?:^abc)|(?:^z)", M("abc"), M("z"));
 
     // Make sure some curious regexes have no prefixes.
     test_lit!(pfx_nothing1, prefixes, ".");
@@ -1258,6 +1307,7 @@ mod tests {
 
     // Test regexes with empty assertions.
     test_lit!(sfx_empty1, suffixes, "a$", M("a"));
+    test_lit!(sfx_empty2, suffixes, "${2}a", C("a"));
 
     // Make sure some curious regexes have no suffixes.
     test_lit!(sfx_nothing1, suffixes, ".");
@@ -1340,8 +1390,45 @@ mod tests {
                 vec![M("Mo'"), M("Mu'"), M("Mo"), M("Mu")],
                 vec![C("Mo"), C("Mu")]);
     test_unamb!(unambiguous11,
-                vec![M("zazb"), M("azb")], vec![C("azb"), C("z")]);
+                vec![M("zazb"), M("azb")], vec![C("a"), C("z")]);
     test_unamb!(unambiguous12, vec![M("foo"), C("foo")], vec![C("foo")]);
+    test_unamb!(unambiguous13,
+                vec![M("ABCX"), M("CDAX"), M("BCX")],
+                vec![C("A"), C("BCX"), C("CD")]);
+    test_unamb!(unambiguous14,
+                vec![M("IMGX"), M("MVIX"), M("MGX"), M("DSX")],
+                vec![M("DSX"), C("I"), C("MGX"), C("MV")]);
+    test_unamb!(unambiguous15,
+                vec![M("IMG_"), M("MG_"), M("CIMG")],
+                vec![C("C"), C("I"), C("MG_")]);
+
+
+    // ************************************************************************
+    // Tests for suffix trimming.
+    // ************************************************************************
+    macro_rules! test_trim {
+        ($name:ident, $trim:expr, $given:expr, $expected:expr) => {
+            #[test]
+            fn $name() {
+                let given: Vec<Lit> =
+                    $given
+                    .into_iter()
+                    .map(|ul| {
+                        let cut = ul.is_cut();
+                        Lit { v: ul.v.into_bytes(), cut: cut }
+                    })
+                    .collect();
+                let lits = create_lits(given);
+                let got = lits.trim_suffix($trim).unwrap();
+                assert_eq!($expected, escape_lits(got.literals()));
+            }
+        }
+    }
+
+    test_trim!(trim1, 1, vec![M("ab"), M("yz")], vec![C("a"), C("y")]);
+    test_trim!(trim2, 1, vec![M("abc"), M("abd")], vec![C("ab")]);
+    test_trim!(trim3, 2, vec![M("abc"), M("abd")], vec![C("a")]);
+    test_trim!(trim4, 2, vec![M("abc"), M("ghij")], vec![C("a"), C("gh")]);
 
     // ************************************************************************
     // Tests for longest common prefix.

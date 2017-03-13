@@ -257,7 +257,7 @@ pub struct ClassRange {
 
     /// The end character of the range.
     ///
-    /// This must be greater than or equal to `end`.
+    /// This must be greater than or equal to `start`.
     pub end: char,
 }
 
@@ -528,6 +528,21 @@ impl Expr {
         }
     }
 
+    /// Returns true if and only if the expression has at least one matchable
+    /// sub-expression that must match the beginning of text.
+    pub fn has_anchored_start(&self) -> bool {
+        match *self {
+            Repeat { ref e, r, .. } => {
+                !r.matches_empty() && e.has_anchored_start()
+            }
+            Group { ref e, .. } => e.has_anchored_start(),
+            Concat(ref es) => es[0].has_anchored_start(),
+            Alternate(ref es) => es.iter().any(|e| e.has_anchored_start()),
+            StartText => true,
+            _ => false,
+        }
+    }
+
     /// Returns true if and only if the expression is required to match at the
     /// end of the text.
     pub fn is_anchored_end(&self) -> bool {
@@ -538,6 +553,21 @@ impl Expr {
             Group { ref e, .. } => e.is_anchored_end(),
             Concat(ref es) => es[es.len() - 1].is_anchored_end(),
             Alternate(ref es) => es.iter().all(|e| e.is_anchored_end()),
+            EndText => true,
+            _ => false,
+        }
+    }
+
+    /// Returns true if and only if the expression has at least one matchable
+    /// sub-expression that must match the beginning of text.
+    pub fn has_anchored_end(&self) -> bool {
+        match *self {
+            Repeat { ref e, r, .. } => {
+                !r.matches_empty() && e.has_anchored_end()
+            }
+            Group { ref e, .. } => e.has_anchored_end(),
+            Concat(ref es) => es[es.len() - 1].has_anchored_end(),
+            Alternate(ref es) => es.iter().any(|e| e.has_anchored_end()),
             EndText => true,
             _ => false,
         }
@@ -1200,6 +1230,22 @@ impl fmt::Display for CharClass {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         try!(write!(f, "(?u:["));
         for range in self.iter() {
+            if range.start == '-' || range.end == '-' {
+                try!(write!(f, "-"));
+                break;
+            }
+        }
+        for range in self.iter() {
+            let mut range = *range;
+            if range.start == '-' {
+                range.start = ((range.start as u8) + 1) as char;
+            }
+            if range.end == '-' {
+                range.end = ((range.end as u8) - 1) as char;
+            }
+            if range.start > range.end {
+                continue;
+            }
             try!(write!(f, "{}", range));
         }
         try!(write!(f, "])"));
@@ -1217,6 +1263,22 @@ impl fmt::Display for ByteClass {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         try!(write!(f, "(?-u:["));
         for range in self.iter() {
+            if range.start == b'-' || range.end == b'-' {
+                try!(write!(f, "-"));
+                break;
+            }
+        }
+        for range in self.iter() {
+            let mut range = *range;
+            if range.start == b'-' {
+                range.start += 1;
+            }
+            if range.end == b'-' {
+                range.start -= 1;
+            }
+            if range.start > range.end {
+                continue;
+            }
             try!(write!(f, "{}", range));
         }
         try!(write!(f, "])"));
@@ -1336,6 +1398,20 @@ pub enum ErrorKind {
     /// This never returned if the parser is permitted to allow expressions
     /// that match arbitrary bytes.
     InvalidUtf8,
+    /// A character class was constructed such that it is empty.
+    /// e.g., `[^\d\D]`.
+    EmptyClass,
+    /// Indicates that unsupported notation was used in a character class.
+    ///
+    /// The char in this error corresponds to the illegal character.
+    ///
+    /// The intent of this error is to carve a path to support set notation
+    /// as described in UTS#18 RL1.3. We do this by rejecting regexes that
+    /// would use the notation.
+    ///
+    /// The work around for end users is to escape the character included in
+    /// this error message.
+    UnsupportedClassChar(char),
     /// Hints that destructuring should not be exhaustive.
     ///
     /// This enum may grow additional variants, so this makes sure clients
@@ -1398,6 +1474,8 @@ impl ErrorKind {
             FlagNotAllowed(_) => "flag not allowed",
             UnicodeNotAllowed => "Unicode features not allowed",
             InvalidUtf8 => "matching arbitrary bytes is not allowed",
+            EmptyClass => "empty character class",
+            UnsupportedClassChar(_) => "unsupported class notation",
             __Nonexhaustive => unreachable!(),
         }
     }
@@ -1460,11 +1538,12 @@ impl fmt::Display for ErrorKind {
                 write!(f, "Number does not correspond to a Unicode scalar \
                            value: '{}'.", c),
             MissingBase10 =>
-                write!(f, "Missing maximum in counted reptition operator."),
+                write!(f, "Missing maximum in counted
+repetition operator."),
             RepeaterExpectsExpr =>
-                write!(f, "Missing expression for reptition operator."),
+                write!(f, "Missing expression for repetition operator."),
             RepeaterUnexpectedExpr(ref e) =>
-                write!(f, "Invalid application of reptition operator to: \
+                write!(f, "Invalid application of repetition operator to: \
                           '{}'.", e),
             UnclosedCaptureName(ref s) =>
                 write!(f, "Capture name group for '{}' is not closed. \
@@ -1494,7 +1573,7 @@ impl fmt::Display for ErrorKind {
                 write!(f, "Unrecognized escape sequence: '\\{}'.", c),
             UnrecognizedFlag(c) =>
                 write!(f, "Unrecognized flag: '{}'. \
-                           (Allowed flags: i, s, m, U, x.)", c),
+                           (Allowed flags: i, m, s, U, u, x.)", c),
             UnrecognizedUnicodeClass(ref s) =>
                 write!(f, "Unrecognized Unicode class name: '{}'.", s),
             StackExhausted =>
@@ -1507,6 +1586,11 @@ impl fmt::Display for ErrorKind {
                            (u) flag is not set."),
             InvalidUtf8 =>
                 write!(f, "Matching arbitrary bytes is not allowed."),
+            EmptyClass =>
+                write!(f, "Empty character classes are not allowed."),
+            UnsupportedClassChar(c) =>
+                write!(f, "Use of unescaped '{}' in character class is \
+                           not allowed.", c),
             __Nonexhaustive => unreachable!(),
         }
     }
@@ -1551,7 +1635,7 @@ fn binary_search<T, F>(xs: &[T], mut pred: F) -> usize
 ///
 /// The string returned may be safely used as a literal in a regular
 /// expression.
-pub fn quote(text: &str) -> String {
+pub fn escape(text: &str) -> String {
     let mut quoted = String::with_capacity(text.len());
     for c in text.chars() {
         if parser::is_punct(c) {
@@ -1962,5 +2046,14 @@ mod tests {
         let cls = bclass(&[(b'@', b'@')]);
         assert_eq!(cls.clone().canonicalize(), bclass(&[(b'@', b'@')]));
         assert_eq!(cls.case_fold(), bclass(&[(b'@', b'@')]));
+    }
+
+    #[test]
+    fn roundtrip_class_hypen() {
+        let expr = e("[-./]");
+        assert_eq!("(?u:[-\\.-/])", expr.to_string());
+
+        let expr = e("(?-u)[-./]");
+        assert_eq!("(?-u:[-\\.-/])", expr.to_string());
     }
 }

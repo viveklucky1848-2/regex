@@ -29,6 +29,13 @@ extern "C" {
 typedef struct rure rure;
 
 /*
+ * rure_set is the type of a set of compiled regular expressions.
+ *
+ * A rure can be safely used from multiple threads simultaneously.
+ */
+typedef struct rure_set rure_set;
+
+/*
  * rure_options is the set of non-flag configuration options for compiling
  * a regular expression. Currently, only two options are available: setting
  * the size limit of the compiled program and setting the size limit of the
@@ -99,6 +106,17 @@ typedef struct rure_captures rure_captures;
 typedef struct rure_iter rure_iter;
 
 /*
+ * rure_iter_capture_names is an iterator over the list of capture group names
+ * in this particular rure.
+ *
+ * An rure_iter_capture_names value may not outlive its corresponding rure,
+ * and should be freed before its corresponding rure is freed.
+ *
+ * It is not safe to use from multiple threads simultaneously.
+ */
+typedef struct rure_iter_capture_names rure_iter_capture_names;
+
+/*
  * rure_error is an error that caused compilation to fail.
  *
  * Most errors are syntax errors but an error can be returned if the compiled
@@ -154,7 +172,7 @@ rure *rure_compile(const uint8_t *pattern, size_t length,
 /*
  * rure_free frees the given compiled regular expression.
  *
- * This must be called at most once.
+ * This must be called at most once for any rure.
  */
 void rure_free(rure *re);
 
@@ -267,6 +285,28 @@ bool rure_shortest_match(rure *re, const uint8_t *haystack, size_t length,
 int32_t rure_capture_name_index(rure *re, const char *name);
 
 /*
+ * rure_iter_capture_names_new creates a new capture_names iterator.
+ *
+ * An iterator will report all successive capture group names of re.
+ */
+rure_iter_capture_names *rure_iter_capture_names_new(rure *re);
+
+/*
+ * rure_iter_capture_names_free frees the iterator given.
+ *
+ * It must be called at most once.
+ */
+void rure_iter_capture_names_free(rure_iter_capture_names *it);
+
+/*
+ * rure_iter_capture_names_next advances the iterator and returns true
+ * if and only if another capture group name exists.
+ *
+ * The value of the capture group name is written to the provided pointer.
+ */
+bool rure_iter_capture_names_next(rure_iter_capture_names *it, char **name);
+
+/*
  * rure_iter_new creates a new iterator.
  *
  * An iterator will report all successive non-overlapping matches of re.
@@ -305,7 +345,7 @@ bool rure_iter_next(rure_iter *it, const uint8_t *haystack, size_t length,
                     rure_match *match);
 
 /*
- * rure_iter_next advances the iterator and returns true if and only if a
+ * rure_iter_next_captures advances the iterator and returns true if and only if a
  * match was found. If a match is found, then all of its capture locations are
  * stored in the captures pointer given.
  *
@@ -412,6 +452,90 @@ void rure_options_size_limit(rure_options *options, size_t limit);
  * specified here.
  */
 void rure_options_dfa_size_limit(rure_options *options, size_t limit);
+
+/*
+ * rure_compile_set compiles the given list of patterns into a single regular
+ * expression which can be matched in a linear-scan. Each pattern in patterns
+ * must be valid UTF-8 and the length of each pattern in patterns corresponds
+ * to a byte length in patterns_lengths.
+ *
+ * The number of patterns to compile is specified by patterns_count. patterns
+ * must contain at least this many entries.
+ *
+ * flags is a bitfield. Valid values are constants declared with prefix
+ * RURE_FLAG_.
+ *
+ * options contains non-flag configuration settings. If it's NULL, default
+ * settings are used. options may be freed immediately after a call to
+ * rure_compile.
+ *
+ * error is set if there was a problem compiling the pattern.
+ *
+ * The compiled expression set returned may be used from multiple threads.
+ */
+rure_set *rure_compile_set(const uint8_t **patterns,
+                           const size_t *patterns_lengths,
+                           size_t patterns_count,
+                           uint32_t flags,
+                           rure_options *options,
+                           rure_error *error);
+
+/*
+ * rure_set_free frees the given compiled regular expression set.
+ *
+ * This must be called at most once for any rure_set.
+ */
+void rure_set_free(rure_set *re);
+
+/*
+ * rure_is_match returns true if and only if any regexes within the set
+ * match anywhere in the haystack. Once a match has been located, the
+ * matching engine will quit immediately.
+ *
+ * haystack may contain arbitrary bytes, but ASCII compatible text is more
+ * useful. UTF-8 is even more useful. Other text encodings aren't supported.
+ * length should be the number of bytes in haystack.
+ *
+ * start is the position at which to start searching. Note that setting the
+ * start position is distinct from incrementing the pointer, since the regex
+ * engine may look at bytes before the start position to determine match
+ * information. For example, if the start position is greater than 0, then the
+ * \A ("begin text") anchor can never match.
+ */
+bool rure_set_is_match(rure_set *re, const uint8_t *haystack, size_t length,
+                       size_t start);
+
+/*
+ * rure_set_matches compares each regex in the set against the haystack and
+ * modifies matches with the match result of each pattern. Match results are
+ * ordered in the same way as the rure_set was compiled. For example,
+ * index 0 of matches corresponds to the first pattern passed to
+ * `rure_compile_set`.
+ *
+ * haystack may contain arbitrary bytes, but ASCII compatible text is more
+ * useful. UTF-8 is even more useful. Other text encodings aren't supported.
+ * length should be the number of bytes in haystack.
+ *
+ * start is the position at which to start searching. Note that setting the
+ * start position is distinct from incrementing the pointer, since the regex
+ * engine may look at bytes before the start position to determine match
+ * information. For example, if the start position is greater than 0, then the
+ * \A ("begin text") anchor can never match.
+ *
+ * matches must be greater than or equal to the number of patterns the
+ * rure_set was compiled with.
+ *
+ * Only use this function if you specifically need to know which regexes
+ * matched within the set. To determine if any of the regexes matched without
+ * caring which, use rure_set_is_match.
+ */
+bool rure_set_matches(rure_set *re, const uint8_t *haystack, size_t length,
+                      size_t start, bool *matches);
+
+/*
+ * rure_set_len returns the number of patterns rure_set was compiled with.
+ */
+size_t rure_set_len(rure_set *re);
 
 /*
  * rure_error_new allocates space for an error.

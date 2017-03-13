@@ -26,8 +26,6 @@ use prog::{
 
 use Error;
 
-type InstHoleIdx = InstPtr;
-
 type Result = result::Result<Patch, Error>;
 
 #[derive(Debug)]
@@ -372,6 +370,7 @@ impl Compiler {
     }
 
     fn c_class(&mut self, ranges: &[ClassRange]) -> Result {
+        assert!(!ranges.is_empty());
         if self.compiled.uses_bytes() {
             CompileClass {
                 c: self,

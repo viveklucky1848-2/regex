@@ -195,6 +195,62 @@ done:
     return passed;
 }
 
+bool test_iter_capture_name(char *expect, char *given) {
+    bool passed = true;
+    if (strcmp(expect, given)) {
+        if (DEBUG) {
+            fprintf(stderr,
+                    "[test_iter_capture_name] expected first capture "
+                    "name '%s' got '%s'\n",
+                    expect, given);
+        }
+        passed = false;
+    }
+    return passed;
+}
+
+bool test_iter_capture_names() {
+    bool passed = true;
+
+    char *name;
+    rure *re = rure_compile_must(
+        "(?P<year>\\d{4})-(?P<month>\\d{2})-(?P<day>\\d{2})");
+    rure_iter_capture_names *it = rure_iter_capture_names_new(re);
+
+    bool result = rure_iter_capture_names_next(it, &name);
+    if (!result) {
+        if (DEBUG) {
+            fprintf(stderr,
+                    "[test_iter_capture_names] expected a second name, "
+                    "but got none\n");
+        }
+        passed = false;
+        goto done;
+    }
+
+    result = rure_iter_capture_names_next(it, &name);
+    passed = test_iter_capture_name("year", name);
+    if (!passed) {
+        goto done;
+    }
+
+    result = rure_iter_capture_names_next(it, &name);
+    passed = test_iter_capture_name("month", name);
+    if (!passed) {
+        goto done;
+    }
+
+    result = rure_iter_capture_names_next(it, &name);
+    passed = test_iter_capture_name("day", name);
+    if (!passed) {
+        goto done;
+    }
+done:
+    rure_iter_capture_names_free(it);
+    rure_free(re);
+    return passed;
+}
+
 /*
  * This tests whether we can set the flags correctly. In this case, we disable
  * all flags, which includes disabling Unicode mode. When we disable Unicode
@@ -277,6 +333,191 @@ bool test_compile_error_size_limit() {
     return passed;
 }
 
+bool test_regex_set_matches() {
+
+#define PAT_COUNT 6
+
+    bool passed = true;
+    const char *patterns[] = {
+        "foo", "barfoo", "\\w+", "\\d+", "foobar", "bar"
+    };
+    const size_t patterns_lengths[] = {
+        3, 6, 3, 3, 6, 3
+    };
+
+    rure_error *err = rure_error_new();
+    rure_set *re = rure_compile_set((const uint8_t **) patterns,
+                                    patterns_lengths,
+                                    PAT_COUNT,
+                                    0,
+                                    NULL,
+                                    err);
+    if (re == NULL) {
+        passed = false;
+        goto done2;
+    }
+
+    if (rure_set_len(re) != PAT_COUNT) {
+        passed = false;
+        goto done1;
+    }
+
+    if (!rure_set_is_match(re, (const uint8_t *) "foobar", 6, 0)) {
+        passed = false;
+        goto done1;
+    }
+
+    if (rure_set_is_match(re, (const uint8_t *) "", 0, 0)) {
+        passed = false;
+        goto done1;
+    }
+
+    bool matches[PAT_COUNT];
+    if (!rure_set_matches(re, (const uint8_t *) "foobar", 6, 0, matches)) {
+        passed = false;
+        goto done1;
+    }
+
+    const bool match_target[] = {
+        true, false, true, false, true, true
+    };
+
+    int i;
+    for (i = 0; i < PAT_COUNT; ++i) {
+        if (matches[i] != match_target[i]) {
+            passed = false;
+            goto done1;
+        }
+    }
+
+done1:
+    rure_set_free(re);
+done2:
+    rure_error_free(err);
+    return passed;
+
+#undef PAT_COUNT
+}
+
+bool test_regex_set_match_start() {
+
+#define PAT_COUNT 3
+
+    bool passed = true;
+    const char *patterns[] = {
+        "foo", "bar", "fooo"
+    };
+    const size_t patterns_lengths[] = {
+        3, 3, 4
+    };
+
+    rure_error *err = rure_error_new();
+    rure_set *re = rure_compile_set((const uint8_t **) patterns,
+                                    patterns_lengths,
+                                    PAT_COUNT,
+                                    0,
+                                    NULL,
+                                    err);
+    if (re == NULL) {
+        passed = false;
+        goto done2;
+    }
+
+    if (rure_set_len(re) != PAT_COUNT) {
+        passed = false;
+        goto done1;
+    }
+
+    if (rure_set_is_match(re, (const uint8_t *)"foobiasdr", 7, 2)) {
+        passed = false;
+        goto done1;
+    }
+
+    {
+        bool matches[PAT_COUNT];
+        if (!rure_set_matches(re, (const uint8_t *)"fooobar", 8, 0, matches)) {
+            passed = false;
+            goto done1;
+        }
+
+        const bool match_target[] = {
+            true, true, true
+        };
+
+        int i;
+        for (i = 0; i < PAT_COUNT; ++i) {
+            if (matches[i] != match_target[i]) {
+                passed = false;
+                goto done1;
+            }
+        }
+    }
+
+    {
+        bool matches[PAT_COUNT];
+        if (!rure_set_matches(re, (const uint8_t *)"fooobar", 7, 1, matches)) {
+            passed = false;
+            goto done1;
+        }
+
+        const bool match_target[] = {
+            false, true, false
+        };
+
+        int i;
+        for (i = 0; i < PAT_COUNT; ++i) {
+            if (matches[i] != match_target[i]) {
+                passed = false;
+                goto done1;
+            }
+        }
+    }
+
+done1:
+    rure_set_free(re);
+done2:
+    rure_error_free(err);
+    return passed;
+
+#undef PAT_COUNT
+}
+
+bool test_regex_set_options() {
+
+    bool passed = true;
+    rure_options *opts = rure_options_new();
+    rure_options_size_limit(opts, 0);
+    rure_error *err = rure_error_new();
+
+    const char *patterns[] = { "\\w{100}" };
+    const size_t patterns_lengths[] = { 8 };
+
+    rure_set *re = rure_compile_set(
+        (const uint8_t **) patterns, patterns_lengths, 1, 0, opts, err);
+    if (re != NULL) {
+        if (DEBUG) {
+            fprintf(stderr,
+                    "[test_compile_error_size_limit] "
+                    "expected NULL regex pointer, but got non-NULL pointer\n");
+        }
+        passed = false;
+        rure_set_free(re);
+    }
+    const char *msg = rure_error_message(err);
+    if (NULL == strstr(msg, "exceeds size")) {
+        if (DEBUG) {
+            fprintf(stderr,
+                    "[test_compile_error] "
+                    "expected an 'exceeds size' error message, but "
+                    "got this instead: '%s'\n", msg);
+        }
+        passed = false;
+    }
+    rure_options_free(opts);
+    rure_error_free(err);
+    return passed;
+}
+
 void run_test(bool (test)(), const char *name, bool *passed) {
     if (!test()) {
         *passed = false;
@@ -294,9 +535,14 @@ int main() {
     run_test(test_find, "test_find", &passed);
     run_test(test_captures, "test_captures", &passed);
     run_test(test_iter, "test_iter", &passed);
+    run_test(test_iter_capture_names, "test_iter_capture_names", &passed);
     run_test(test_flags, "test_flags", &passed);
     run_test(test_compile_error, "test_compile_error", &passed);
     run_test(test_compile_error_size_limit, "test_compile_error_size_limit",
+             &passed);
+    run_test(test_regex_set_matches, "test_regex_set_match", &passed);
+    run_test(test_regex_set_options, "test_regex_set_options", &passed);
+    run_test(test_regex_set_match_start, "test_regex_set_match_start",
              &passed);
 
     if (!passed) {

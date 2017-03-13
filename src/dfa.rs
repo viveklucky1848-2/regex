@@ -152,6 +152,9 @@ struct CacheInner {
     /// The total number of times this cache has been flushed by the DFA
     /// because of space constraints.
     flush_count: u64,
+    /// The total heap size of the DFA's cache. We use this to determine when
+    /// we should flush the cache.
+    size: usize,
 }
 
 /// The transition table.
@@ -420,18 +423,32 @@ impl Cache {
     pub fn new(prog: &Program) -> Self {
         // We add 1 to account for the special EOF byte.
         let num_byte_classes = (prog.byte_classes[255] as usize + 1) + 1;
-        Cache {
+        let starts = vec![STATE_UNKNOWN; 256];
+        let mut cache = Cache {
             inner: CacheInner {
                 compiled: HashMap::new(),
                 trans: Transitions::new(num_byte_classes),
                 states: vec![],
-                start_states: vec![STATE_UNKNOWN; 256],
+                start_states: starts,
                 stack: vec![],
                 flush_count: 0,
+                size: 0,
             },
             qcur: SparseSet::new(prog.insts.len()),
             qnext: SparseSet::new(prog.insts.len()),
-        }
+        };
+        cache.inner.reset_size();
+        cache
+    }
+}
+
+impl CacheInner {
+    /// Resets the cache size to account for fixed costs, such as the program
+    /// and stack sizes.
+    fn reset_size(&mut self) {
+        self.size =
+            (self.start_states.len() * mem::size_of::<StatePtr>())
+            + (self.stack.len() * mem::size_of::<InstPtr>());
     }
 }
 
@@ -1280,6 +1297,7 @@ impl<'a> Fsm<'a> {
         } else {
             None
         };
+        self.cache.reset_size();
         self.cache.trans.clear();
         self.cache.states.clear();
         self.cache.compiled.clear();
@@ -1360,7 +1378,9 @@ impl<'a> Fsm<'a> {
              ((empty_flags.end as u8) << 1) |
              ((empty_flags.start_line as u8) << 2) |
              ((empty_flags.end_line as u8) << 3) |
-             ((state_flags.is_word() as u8) << 4))
+             ((empty_flags.word_boundary as u8) << 4) |
+             ((empty_flags.not_word_boundary as u8) << 5) |
+             ((state_flags.is_word() as u8) << 6))
             as usize
         };
         match self.cache.start_states[flagi] {
@@ -1394,8 +1414,16 @@ impl<'a> Fsm<'a> {
         empty_flags.end = text.len() == 0;
         empty_flags.start_line = at == 0 || text[at - 1] == b'\n';
         empty_flags.end_line = text.len() == 0;
-        if at > 0 && Byte::byte(text[at - 1]).is_ascii_word() {
+
+        let is_word_last = at > 0 && Byte::byte(text[at - 1]).is_ascii_word();
+        let is_word = at < text.len() && Byte::byte(text[at]).is_ascii_word();
+        if is_word_last {
             state_flags.set_word();
+        }
+        if is_word == is_word_last {
+            empty_flags.not_word_boundary = true;
+        } else {
+            empty_flags.word_boundary = true;
         }
         (empty_flags, state_flags)
     }
@@ -1415,8 +1443,17 @@ impl<'a> Fsm<'a> {
         empty_flags.end = text.len() == 0;
         empty_flags.start_line = at == text.len() || text[at] == b'\n';
         empty_flags.end_line = text.len() == 0;
-        if at < text.len() && Byte::byte(text[at]).is_ascii_word() {
+
+        let is_word_last =
+            at < text.len() && Byte::byte(text[at]).is_ascii_word();
+        let is_word = at > 0 && Byte::byte(text[at - 1]).is_ascii_word();
+        if is_word_last {
             state_flags.set_word();
+        }
+        if is_word == is_word_last {
+            empty_flags.not_word_boundary = true;
+        } else {
+            empty_flags.word_boundary = true;
         }
         (empty_flags, state_flags)
     }
@@ -1454,6 +1491,11 @@ impl<'a> Fsm<'a> {
         }
         // Finally, put our actual state on to our heap of states and index it
         // so we can find it later.
+        self.cache.size +=
+            self.cache.trans.state_heap_size()
+            + (2 * state.data.len())
+            + (2 * mem::size_of::<State>())
+            + mem::size_of::<StatePtr>();
         self.cache.states.push(state.clone());
         self.cache.compiled.insert(state, si);
         // Transition table and set of states and map should all be in sync.
@@ -1536,51 +1578,8 @@ impl<'a> Fsm<'a> {
     /// be wiped. Namely, it is possible that for certain regexes on certain
     /// inputs, a new state could be created for every byte of input. (This is
     /// bad for memory use, so we bound it with a cache.)
-    ///
-    /// The approximation is guaranteed to be done in constant time (and
-    /// indeed, this requirement is why it's approximate).
     fn approximate_size(&self) -> usize {
-        use std::mem::size_of as size;
-        // Estimate that there are about 16 instructions per state consuming
-        // 20 = 4 + (15 * 1) bytes of space (1 byte because of delta encoding).
-        const STATE_HEAP: usize = 20 + 1; // one extra byte for flags
-        let compiled =
-            (self.cache.compiled.len() * (size::<State>() + STATE_HEAP))
-            + (self.cache.compiled.len() * size::<StatePtr>());
-        let states =
-            self.cache.states.len()
-            * (size::<State>()
-               + STATE_HEAP
-               + (self.num_byte_classes() * size::<StatePtr>()));
-        let start_states = self.cache.start_states.len() * size::<StatePtr>();
-        self.prog.approximate_size() + compiled + states + start_states
-    }
-
-    /// Returns the actual heap space of the DFA. This visits every state in
-    /// the DFA.
-    #[allow(dead_code)] // useful for debugging
-    fn actual_size(&self) -> usize {
-        let mut compiled = 0;
-        for k in self.cache.compiled.keys() {
-            compiled += mem::size_of::<State>();
-            compiled += mem::size_of::<StatePtr>();
-            compiled += k.data.len() * mem::size_of::<u8>();
-        }
-        let mut states = 0;
-        for s in &self.cache.states {
-            states += mem::size_of::<State>();
-            states += s.data.len() * mem::size_of::<u8>();
-        }
-        compiled
-        + states
-        + (self.cache.trans.num_states() *
-           mem::size_of::<StatePtr>() *
-           self.num_byte_classes())
-        + (self.cache.start_states.len() * mem::size_of::<StatePtr>())
-        + (self.cache.stack.len() * mem::size_of::<InstPtr>())
-        + mem::size_of::<Fsm>()
-        + mem::size_of::<CacheInner>()
-        + self.prog.approximate_size() // OK, not actual, but close enough
+        self.cache.size + self.prog.approximate_size()
     }
 }
 
@@ -1626,6 +1625,11 @@ impl Transitions {
     /// Returns the transition corresponding to (si, cls).
     fn next(&self, si: StatePtr, cls: usize) -> StatePtr {
         self.table[si as usize + cls]
+    }
+
+    /// The heap size, in bytes, of a single state in the transition table.
+    fn state_heap_size(&self) -> usize {
+        self.num_byte_classes * mem::size_of::<StatePtr>()
     }
 
     /// Like `next`, but uses unchecked access and is therefore unsafe.
@@ -1847,7 +1851,7 @@ mod tests {
             expected == got && state.flags() == StateFlags(flags)
         }
         QuickCheck::new()
-            .gen(StdGen::new(self::rand::thread_rng(), 70_000))
+            .gen(StdGen::new(self::rand::thread_rng(), 10_000))
             .quickcheck(p as fn(Vec<u32>, u8) -> bool);
     }
 

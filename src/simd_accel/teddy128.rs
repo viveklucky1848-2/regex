@@ -86,14 +86,14 @@ better. Namely:
 1. Teddy's core algorithm scans the haystack in 16 byte chunks. 16 is
    significant because it corresponds to the number of bytes in a SIMD vector.
    If one used AVX2 instructions, then we could scan the haystack in 32 byte
-   chunks. Similarly, if one used AVX512 instructions, we could sca the
+   chunks. Similarly, if one used AVX512 instructions, we could scan the
    haystack in 64 byte chunks. Hyperscan implements SIMD + AVX2, we only
    implement SIMD for the moment. (The author doesn't have a CPU with AVX2
    support... yet.)
 2. Bitwise operations are performed on each chunk to discover if any region of
    it matches a set of precomputed fingerprints from the patterns. If there are
    matches, then a verification step is performed. In this implementation, our
-   verificiation step is a naive. This can be improved upon.
+   verification step is naive. This can be improved upon.
 
 The details to make this work are quite clever. First, we must choose how to
 pick our fingerprints. In Hyperscan's implementation, I *believe* they use the
@@ -154,7 +154,7 @@ this for `A`:
 
 ```ignore
     0x00 0x01 ... 0x62      ... 0x66      ... 0xFF
-A = 0    0        00000001      00000110      0
+A = 0    0        00000110      00000001      0
 ```
 
 And if `B` contains our window from our haystack, we could use shuffle to take
@@ -321,22 +321,24 @@ References
 
 // TODO: Extend this to use AVX2 instructions.
 // TODO: Extend this to use AVX512 instructions.
-// TODO: Extend this to cleverly use Aho-Corasick. Possibly to replace both
-//       "slow" searching and the verification step.
 // TODO: Make the inner loop do aligned loads.
 
 use std::cmp;
-use std::mem::transmute;
 use std::ptr;
 
+use aho_corasick::{Automaton, AcAutomaton, FullAcAutomaton};
 use simd::u8x16;
-use simd::x86::sse2::u64x2;
+use simd::x86::sse2::Sse2Bool8ix16;
 use simd::x86::ssse3::Ssse3U8x16;
 
 use syntax;
 
 /// Corresponds to the number of bytes read at a time in the haystack.
 const BLOCK_SIZE: usize = 16;
+
+pub fn is_teddy_128_available() -> bool {
+    true
+}
 
 /// Match reports match information.
 #[derive(Debug, Clone)]
@@ -355,6 +357,9 @@ pub struct Match {
 pub struct Teddy {
     /// A list of substrings to match.
     pats: Vec<Vec<u8>>,
+    /// An Aho-Corasick automaton of the patterns. We use this when we need to
+    /// search pieces smaller than the Teddy block size.
+    ac: FullAcAutomaton<Vec<u8>>,
     /// A set of 8 buckets. Each bucket corresponds to a single member of a
     /// bitset. A bucket contains zero or more substrings. This is useful
     /// when the number of substrings exceeds 8, since our bitsets cannot have
@@ -365,7 +370,7 @@ pub struct Teddy {
 }
 
 /// A list of masks. This has length equal to the length of the fingerprint.
-/// The length of the fingerprint is always `max(3, len(smallest_substring))`.
+/// The length of the fingerprint is always `min(3, len(smallest_substring))`.
 #[derive(Debug, Clone)]
 struct Masks(Vec<Mask>);
 
@@ -404,6 +409,7 @@ impl Teddy {
         }
         Some(Teddy {
             pats: pats.to_vec(),
+            ac: AcAutomaton::new(pats.to_vec()).into_full(),
             buckets: buckets,
             masks: masks,
         })
@@ -429,8 +435,6 @@ impl Teddy {
     pub fn find(&self, haystack: &[u8]) -> Option<Match> {
         // If our haystack is smaller than the block size, then fall back to
         // a naive brute force search.
-        //
-        // TODO: Use Aho-Corasick.
         if haystack.is_empty() || haystack.len() < (BLOCK_SIZE + 2) {
             return self.slow(haystack, 0);
         }
@@ -456,8 +460,9 @@ impl Teddy {
             // N.B. `res0` is our `C` in the module documentation.
             let res0 = self.masks.members1(h);
             // Only do expensive verification if there are any non-zero bits.
-            if res0.ne(zero).any() {
-                if let Some(m) = self.verify_128(haystack, pos, res0) {
+            let bitfield = res0.ne(zero).move_mask();
+            if bitfield != 0 {
+                if let Some(m) = self.verify(haystack, pos, res0, bitfield) {
                     return Some(m);
                 }
             }
@@ -510,9 +515,11 @@ impl Teddy {
             // `AND`'s our `C` values together.
             let res = res0prev0 & res1;
             prev0 = res0;
-            if res.ne(zero).any() {
+
+            let bitfield = res.ne(zero).move_mask();
+            if bitfield != 0 {
                 let pos = pos.checked_sub(1).unwrap();
-                if let Some(m) = self.verify_128(haystack, pos, res) {
+                if let Some(m) = self.verify(haystack, pos, res, bitfield) {
                     return Some(m);
                 }
             }
@@ -568,9 +575,11 @@ impl Teddy {
 
             prev0 = res0;
             prev1 = res1;
-            if res.ne(zero).any() {
+
+            let bitfield = res.ne(zero).move_mask();
+            if bitfield != 0 {
                 let pos = pos.checked_sub(2).unwrap();
-                if let Some(m) = self.verify_128(haystack, pos, res) {
+                if let Some(m) = self.verify(haystack, pos, res, bitfield) {
                     return Some(m);
                 }
             }
@@ -585,63 +594,41 @@ impl Teddy {
 
     /// Runs the verification procedure on `res` (i.e., `C` from the module
     /// documentation), where the haystack block starts at `pos` in
-    /// `haystack`.
+    /// `haystack`. `bitfield` has ones in the bit positions that `res` has
+    /// non-zero bytes.
     ///
     /// If a match exists, it returns the first one.
     #[inline(always)]
-    fn verify_128(
+    fn verify(
         &self,
         haystack: &[u8],
         pos: usize,
         res: u8x16,
+        mut bitfield: u32,
     ) -> Option<Match> {
-        // The verification procedure is more amenable to standard 64 bit
-        // values, so get those.
-        let res64: u64x2 = unsafe { transmute(res) };
-        let reshi = res64.extract(0);
-        let reslo = res64.extract(1);
-        if let Some(m) = self.verify_64(haystack, pos, reshi, 0) {
-            return Some(m);
-        }
-        if let Some(m) = self.verify_64(haystack, pos, reslo, 8) {
-            return Some(m);
-        }
-        None
-    }
+        while bitfield != 0 {
+            // The next offset, relative to pos, where some fingerprint
+            // matched.
+            let byte_pos = bitfield.trailing_zeros();
+            bitfield &= !(1 << byte_pos);
 
-    /// Runs the verification procedure on half of `C`.
-    ///
-    /// If a match exists, it returns the first one.
-    ///
-    /// `offset` is an additional byte offset to add to the position before
-    /// substring match verification.
-    #[inline(always)]
-    fn verify_64(
-        &self,
-        haystack: &[u8],
-        pos: usize,
-        mut res: u64,
-        offset: usize,
-    ) -> Option<Match> {
-        // There's a possible match so long as there's at least one bit set.
-        while res != 0 {
-            // The next possible match is at the least significant bit.
-            let bit = res.trailing_zeros();
-            // The position of the bit in its corresponding lane gives us the
-            // corresponding bucket.
-            let bucket = (bit % 8) as usize;
-            // The lane that the bit is in gives us its offset.
-            let bytei = (bit / 8) as usize;
-            // Compute the start of where a substring would start.
-            let start = pos + offset + bytei;
-            // Kill off this bit. If we couldn't match anything, we'll go to
-            // the next bit.
-            res &= !(1 << bit);
-            // Actual substring search verification.
-            if let Some(m) = self.verify_bucket(haystack, bucket, start) {
-                return Some(m);
+            // Offset relative to the beginning of the haystack.
+            let start = pos + byte_pos as usize;
+
+            // The bitfield telling us which patterns had fingerprints that
+            // match at this starting position.
+            let mut patterns = res.extract(byte_pos);
+            while patterns != 0 {
+                let bucket = patterns.trailing_zeros() as usize;
+                patterns &= !(1 << bucket);
+
+                // Actual substring search verification.
+                if let Some(m) = self.verify_bucket(haystack, bucket, start) {
+                    return Some(m);
+                }
             }
         }
+
         None
     }
 
@@ -678,27 +665,13 @@ impl Teddy {
     /// This is used when we don't have enough bytes in the haystack for our
     /// block based approach.
     fn slow(&self, haystack: &[u8], pos: usize) -> Option<Match> {
-        // TODO: Use Aho-Corasick, or otherwise adapt the block based approach
-        // to be capable of using smaller blocks.
-        let mut m = None;
-        for (pi, p) in self.pats.iter().enumerate() {
-            if let Some(i) = find_slow(p, &haystack[pos..]) {
-                let candidate = Match {
-                    pat: pi,
-                    start: pos + i,
-                    end: pos + i + p.len(),
-                };
-                match m {
-                    None => m = Some(candidate),
-                    Some(ref mut m) => {
-                        if candidate.start < m.start {
-                            *m = candidate;
-                        }
-                    }
-                }
+        self.ac.find(&haystack[pos..]).next().map(|m| {
+            Match {
+                pat: m.pati,
+                start: pos + m.start,
+                end: pos + m.end,
             }
-        }
-        m
+        })
     }
 }
 
@@ -811,8 +784,6 @@ impl UnsafeLoad for u8x16 {
     type Elem = u8;
 
     unsafe fn load_unchecked(slice: &[u8], offset: usize) -> u8x16 {
-        // TODO: Can we just do pointer casting here? I don't think so, since
-        // this could be an unaligned load? Help me.
         let mut x = u8x16::splat(0);
         ptr::copy_nonoverlapping(
             slice.get_unchecked(offset),
@@ -820,18 +791,4 @@ impl UnsafeLoad for u8x16 {
             16);
         x
     }
-}
-
-/// Slow single-substring search use for naive brute force matching.
-#[cold]
-pub fn find_slow(pattern: &[u8], haystack: &[u8]) -> Option<usize> {
-    if pattern.len() > haystack.len() {
-        return None;
-    }
-    for i in 0..(haystack.len() - pattern.len() + 1) {
-        if pattern == &haystack[i..i + pattern.len()] {
-            return Some(i);
-        }
-    }
-    None
 }

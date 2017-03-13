@@ -24,7 +24,7 @@ Assuming you have
 (and a C compiler), then this should work to run the `iter` example:
 
 ```
-$ git clone git://github.com/rust-lang-nursery/regex
+$ git clone git://github.com/rust-lang/regex
 $ cd regex/regex-capi/examples
 $ ./compile
 $ LD_LIBRARY_PATH=../target/release ./iter
@@ -42,7 +42,7 @@ All memory usage is bounded and all searching takes linear time with respect
 to the input string.
 
 For more details, see the PERFORMANCE guide:
-https://github.com/rust-lang-nursery/regex/blob/master/PERFORMANCE.md
+https://github.com/rust-lang/regex/blob/master/PERFORMANCE.md
 
 
 Text encoding
@@ -99,7 +99,5 @@ There are a few things missing from the C API that are present in the Rust API.
 There's no particular (known) reason why they don't, they just haven't been
 implemented yet.
 
-* RegexSet, which permits matching multiple regular expressions simultaneously
-  in a single linear time search.
 * Splitting a string by a regex.
 * Replacing regex matches in a string with some other text.

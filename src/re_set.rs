@@ -9,7 +9,8 @@
 // except according to those terms.
 
 macro_rules! define_set {
-    ($name:ident, $exec_build:expr, $text_ty:ty, $as_bytes:expr) => {
+    ($name:ident, $builder_mod:ident, $text_ty:ty, $as_bytes:expr,
+     $(#[$doc_regexset_example:meta])* ) => {
         pub mod $name {
             use std::fmt;
             use std::iter;
@@ -17,7 +18,8 @@ macro_rules! define_set {
             use std::vec;
 
             use error::Error;
-            use exec::{Exec, ExecBuilder};
+            use exec::Exec;
+            use re_builder::$builder_mod::RegexSetBuilder;
             use re_trait::RegularExpression;
 
 /// Match multiple (possibly overlapping) regular expressions in a single scan.
@@ -46,28 +48,7 @@ macro_rules! define_set {
 /// This shows how the above two regexes (for matching email addresses and
 /// domains) might work:
 ///
-/// ```rust
-/// # use regex::RegexSet;
-/// let set = RegexSet::new(&[
-///     r"[a-z]+@[a-z]+\.(com|org|net)",
-///     r"[a-z]+\.(com|org|net)",
-/// ]).unwrap();
-///
-/// // Ask whether any regexes in the set match.
-/// assert!(set.is_match("foo@example.com"));
-///
-/// // Identify which regexes in the set match.
-/// let matches: Vec<_> = set.matches("foo@example.com").into_iter().collect();
-/// assert_eq!(vec![0, 1], matches);
-///
-/// // Try again, but with text that only matches one of the regexes.
-/// let matches: Vec<_> = set.matches("example.com").into_iter().collect();
-/// assert_eq!(vec![1], matches);
-///
-/// // Try again, but with text that doesn't match any regex in the set.
-/// let matches: Vec<_> = set.matches("example").into_iter().collect();
-/// assert!(matches.is_empty());
-/// ```
+$(#[$doc_regexset_example])*
 ///
 /// Note that it would be possible to adapt the above example to using `Regex`
 /// with an expression like:
@@ -122,8 +103,7 @@ impl RegexSet {
     /// ```
     pub fn new<I, S>(exprs: I) -> Result<RegexSet, Error>
             where S: AsRef<str>, I: IntoIterator<Item=S> {
-        let exec = try!($exec_build(exprs));
-        Ok(RegexSet(exec))
+        RegexSetBuilder::new(exprs).build()
     }
 
     /// Returns true if and only if one of the regexes in this set matches
@@ -151,7 +131,18 @@ impl RegexSet {
     /// assert!(!set.is_match("☃"));
     /// ```
     pub fn is_match(&self, text: $text_ty) -> bool {
-        self.0.searcher().is_match_at($as_bytes(text), 0)
+        self.is_match_at(text, 0)
+    }
+
+    /// Returns the same as is_match, but starts the search at the given
+    /// offset.
+    ///
+    /// The significance of the starting point is that it takes the surrounding
+    /// context into consideration. For example, the `\A` anchor can only
+    /// match when `start == 0`.
+    #[doc(hidden)]
+    pub fn is_match_at(&self, text: $text_ty, start: usize) -> bool {
+        self.0.searcher().is_match_at($as_bytes(text), start)
     }
 
     /// Returns the set of regular expressions that match in the given text.
@@ -192,12 +183,33 @@ impl RegexSet {
     /// ```
     pub fn matches(&self, text: $text_ty) -> SetMatches {
         let mut matches = vec![false; self.0.regex_strings().len()];
-        let any = self.0.searcher().many_matches_at(
-            &mut matches, $as_bytes(text), 0);
+        let any = self.read_matches_at(&mut matches, text, 0);
         SetMatches {
             matched_any: any,
             matches: matches,
         }
+    }
+
+    /// Returns the same as matches, but starts the search at the given
+    /// offset and stores the matches into the slice given.
+    ///
+    /// The significance of the starting point is that it takes the surrounding
+    /// context into consideration. For example, the `\A` anchor can only
+    /// match when `start == 0`.
+    ///
+    /// `matches` must have a length that is at least the number of regexes
+    /// in this set.
+    ///
+    /// This method returns true if and only if at least one member of
+    /// `matches` is true after executing the set against `text`.
+    #[doc(hidden)]
+    pub fn read_matches_at(
+        &self,
+        matches: &mut [bool],
+        text: $text_ty,
+        start: usize,
+    ) -> bool {
+        self.0.searcher().many_matches_at(matches, $as_bytes(text), start)
     }
 
     /// Returns the total number of regular expressions in this set.
@@ -277,6 +289,18 @@ impl Iterator for SetMatchesIntoIter {
     }
 }
 
+impl DoubleEndedIterator for SetMatchesIntoIter {
+    fn next_back(&mut self) -> Option<usize> {
+        loop {
+            match self.0.next_back() {
+                None => return None,
+                Some((_, false)) => {}
+                Some((i, true)) => return Some(i),
+            }
+        }
+    }
+}
+
 /// A borrowed iterator over the set of matches from a regex set.
 ///
 /// The lifetime `'a` refers to the lifetime of a `SetMatches` value.
@@ -289,6 +313,18 @@ impl<'a> Iterator for SetMatchesIter<'a> {
     fn next(&mut self) -> Option<usize> {
         loop {
             match self.0.next() {
+                None => return None,
+                Some((_, &false)) => {}
+                Some((i, &true)) => return Some(i),
+            }
+        }
+    }
+}
+
+impl<'a> DoubleEndedIterator for SetMatchesIter<'a> {
+    fn next_back(&mut self) -> Option<usize> {
+        loop {
+            match self.0.next_back() {
                 None => return None,
                 Some((_, &false)) => {}
                 Some((i, &true)) => return Some(i),
@@ -318,14 +354,58 @@ impl fmt::Debug for RegexSet {
 
 define_set! {
     unicode,
-    |exprs| ExecBuilder::new_many(exprs).build(),
+    set_unicode,
     &str,
-    as_bytes_str
+    as_bytes_str,
+/// ```rust
+/// # use regex::RegexSet;
+/// let set = RegexSet::new(&[
+///     r"[a-z]+@[a-z]+\.(com|org|net)",
+///     r"[a-z]+\.(com|org|net)",
+/// ]).unwrap();
+///
+/// // Ask whether any regexes in the set match.
+/// assert!(set.is_match("foo@example.com"));
+///
+/// // Identify which regexes in the set match.
+/// let matches: Vec<_> = set.matches("foo@example.com").into_iter().collect();
+/// assert_eq!(vec![0, 1], matches);
+///
+/// // Try again, but with text that only matches one of the regexes.
+/// let matches: Vec<_> = set.matches("example.com").into_iter().collect();
+/// assert_eq!(vec![1], matches);
+///
+/// // Try again, but with text that doesn't match any regex in the set.
+/// let matches: Vec<_> = set.matches("example").into_iter().collect();
+/// assert!(matches.is_empty());
+/// ```
 }
 
 define_set! {
     bytes,
-    |exprs| ExecBuilder::new_many(exprs).only_utf8(false).build(),
+    set_bytes,
     &[u8],
-    as_bytes_bytes
+    as_bytes_bytes,
+/// ```rust
+/// # use regex::bytes::RegexSet;
+/// let set = RegexSet::new(&[
+///     r"[a-z]+@[a-z]+\.(com|org|net)",
+///     r"[a-z]+\.(com|org|net)",
+/// ]).unwrap();
+///
+/// // Ask whether any regexes in the set match.
+/// assert!(set.is_match(b"foo@example.com"));
+///
+/// // Identify which regexes in the set match.
+/// let matches: Vec<_> = set.matches(b"foo@example.com").into_iter().collect();
+/// assert_eq!(vec![0, 1], matches);
+///
+/// // Try again, but with text that only matches one of the regexes.
+/// let matches: Vec<_> = set.matches(b"example.com").into_iter().collect();
+/// assert_eq!(vec![1], matches);
+///
+/// // Try again, but with text that doesn't match any regex in the set.
+/// let matches: Vec<_> = set.matches(b"example").into_iter().collect();
+/// assert!(matches.is_empty());
+/// ```
 }

@@ -13,7 +13,7 @@
 // regexes on small inputs because of its memory requirements.
 //
 // In particular, this is a *bounded* backtracking engine. It retains worst
-// case linear time by keeping track of the states that is has visited (using a
+// case linear time by keeping track of the states that it has visited (using a
 // bitmap). Namely, once a state is visited, it is never visited again. Since a
 // state is keyed by `(instruction index, input index)`, we have that its time
 // complexity is `O(mn)` (i.e., linear in the size of the search text).
@@ -44,7 +44,7 @@ pub fn should_exec(num_insts: usize, text_len: usize) -> bool {
     //   ((len(insts) * (len(input) + 1) + bits - 1) / bits) * (size_of(u32))
     //
     // The actual limit picked is pretty much a heuristic.
-    // See: https://github.com/rust-lang-nursery/regex/issues/215
+    // See: https://github.com/rust-lang/regex/issues/215
     let size = ((num_insts * (text_len + 1) + BIT_SIZE - 1) / BIT_SIZE) * 4;
     size <= MAX_SIZE_BYTES
 }
@@ -242,9 +242,7 @@ impl<'a, 'm, 'r, 's, I: Input> Bounded<'a, 'm, 'r, 's, I> {
                     ip = inst.goto1;
                 }
                 EmptyLook(ref inst) => {
-                    let prev = self.input.previous_char(at);
-                    let next = self.input.next_char(at);
-                    if inst.matches(prev, next) {
+                    if self.input.is_empty_match(at, inst) {
                         ip = inst.goto;
                     } else {
                         return false;
